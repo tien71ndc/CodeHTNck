@@ -2,288 +2,256 @@
 #include <WebServer.h>
 #include <DHT.h>
 #include <ESP32Servo.h>
+#include "time.h"
 
-// ====== CONFIG ======
-#define DHTPIN 2
-#define DHTTYPE DHT11
-#define GAS_PIN 1
-#define PIR_PIN 3
-#define BUZZER 4
-#define RELAY_LIGHT 6
-#define RELAY_FAN 7
-#define SERVO_PIN 10
+// =====================================================
+//                CONFIG HARDWARE
+// =====================================================
+#define DHTPIN          2
+#define DHTTYPE         DHT11
+#define GAS_PIN         1
+#define PIR_PIN         3
+#define BUZZER          4
+#define RELAY_LIGHT     6
 
 const bool PIR_ACTIVE_LOW = true;
 
-DHT dht(DHTPIN, DHTTYPE);
-Servo servoLock;
-WebServer server(80);
-
-// WiFi
-const char* ssid = "iPhone";
+// WiFi Config
+const char* ssid     = "iPhone";
 const char* password = "22122003";
 
-// ====== BIẾN TOÀN CỤC ======
-bool stateLight = false;
-bool stateFan = false;
+// NTP Server config
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600; 
+const int   daylightOffset_sec = 0;
+
+// Objects
+DHT dht(DHTPIN, DHTTYPE);
+WebServer server(80);
+
+// Global Variables
 float temperature = 0, humidity = 0, gasValue = 0;
-bool motionDetected = false;
+bool motionDetected = false, stateLight = false, gasAlert = false;
+const int GAS_THRESHOLD = 60;
 
-// Trạng thái cảnh báo
-bool gasAlert = false;
-const int GAS_THRESHOLD = 60;  
+// Nhật ký (Log)
+String motionLogs[5] = {"-", "-", "-", "-", "-"}; 
+String tempLogs[5] = {"-", "-", "-", "-", "-"};   
+unsigned long lastTempLogTick = 0;
 
-// Lọc nhiễu PIR
-unsigned long motionStart = 0;
-unsigned long motionStop = 0;
-bool motionState = false;
+// FreeRTOS Handles
+SemaphoreHandle_t dataMutex;
 
-// Cờ hiệu cho Task Mở cửa
-volatile bool unlockRequested = false;
+String getTimeString() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)) return "00:00:00";
+  char timeStringBuff[20];
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M:%S", &timeinfo);
+  return String(timeStringBuff);
+}
 
-// ====== Web UI ======
+// =====================================================
+//                WEB UI
+// =====================================================
 void handleRoot() {
-  String html = R"====(
+  String html = R"rawliteral(
 <!doctype html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32C3 Smart Dashboard</title>
+<title>ESP32 Smart Home RTOS</title>
 <style>
-body{font-family:'Segoe UI',Arial;background:linear-gradient(120deg,#74ABE2,#5563DE);color:#fff;margin:0;padding:20px;}
-.wrap{max-width:900px;margin:auto}
-h1{margin:0 0 16px 0;font-size:1.6rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
-.card{background:rgba(255,255,255,0.12);padding:14px;border-radius:15px;backdrop-filter:blur(8px);box-shadow:0 4px 10px rgba(0,0,0,0.25)}
-.label{opacity:0.9}
-.value{font-size:1.4rem;font-weight:700;margin-top:6px}
-button{padding:10px 16px;border-radius:10px;border:none;cursor:pointer;font-weight:600;font-size:1em;transition:0.3s;}
-button:active{transform:scale(0.95);}
-.on{background:#00c853;color:#fff}
-.off{background:#c62828;color:#fff}
-.action{background:#2196f3;color:#fff}
-.alert{background:#ff5252;padding:10px;border-radius:8px;margin-bottom:12px;text-align:center;font-weight:bold;}
-footer{margin-top:20px;opacity:0.8;text-align:center;font-size:0.9em}
+body{font-family:Arial;background:linear-gradient(120deg,#1f1c2c,#928dab);color:white;padding:20px;}
+.wrap{max-width:900px;margin:auto;}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:15px;}
+.card{background:rgba(255,255,255,0.12);padding:15px;border-radius:15px;backdrop-filter:blur(6px);}
+.value{font-size:1.5rem;font-weight:bold;margin-top:8px;}
+button{padding:10px 15px;border:none;border-radius:10px;font-weight:bold;cursor:pointer;}
+.on{background:#00c853;color:white;} .off{background:#c62828;color:white;}
+.alert{background:#ff5252;padding:10px;margin-bottom:10px;border-radius:10px;font-weight:bold;}
+table{width:100%; border-collapse: collapse; margin-top:10px; background:rgba(0,0,0,0.2); border-radius:10px; overflow:hidden;}
+th, td{padding:10px; text-align:left; border-bottom: 1px solid rgba(255,255,255,0.1);}
+th{background:rgba(255,255,255,0.1);}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>🏠 He Thong Giam Sat Khi Gas va Nhiet Do </h1>
+<h1>🏠 ESP32 SMART HOME</h1>
 <div id="alertArea"></div>
 <div class="grid">
-  <div class="card"><div class="label">🌡️ Temperature</div><div class="value" id="temp">-- °C</div></div>
-  <div class="card"><div class="label">💧 Humidity</div><div class="value" id="hum">-- %</div></div>
-  <div class="card"><div class="label">🔥 Gas</div><div class="value" id="gas">-- %</div></div>
-  <div class="card"><div class="label">🚶 Motion</div><div class="value" id="motion">--</div></div>
-  <div class="card"><div class="label">💡 Light</div><button id="btn1" class="off" onclick="setRelay(1)">OFF</button></div>
-  <div class="card"><div class="label">🌀 Fan</div><button id="btn2" class="off" onclick="setRelay(2)">OFF</button></div>
-  <div class="card"><div class="label">🔓 Door</div><button class="action" onclick="unlock()">Unlock</button></div>
+<div class="card"><div>🌡️ Temperature</div><div class="value" id="temp">--</div></div>
+<div class="card"><div>💧 Humidity</div><div class="value" id="hum">--</div></div>
+<div class="card"><div>🔥 Gas</div><div class="value" id="gas">--</div></div>
+<div class="card"><div>🚶 Motion</div><div class="value" id="motion">--</div></div>
+<div class="card"><div>💡 Light</div><button id="btn1" class="off" onclick="toggleRelay(1)">OFF</button></div>
 </div>
-<footer>ESP32C3 Local Dashboard © 2026 - Phát triển bởi Phạm Phú Quý</footer>
+
+<div class="grid" style="margin-top:20px;">
+  <div class="card">
+    <h3>🕒 Nhật ký ra vào</h3>
+    <table id="motionTable"><thead><tr><th>Thời gian </th></tr></thead><tbody id="motionBody"></tbody></table>
+  </div>
+  <div class="card">
+    <h3>📊 Nhiệt độ </h3>
+    <table id="tempTable"><thead><tr><th>Giờ</th><th>Nhiệt độ</th></tr></thead><tbody id="tempBody"></tbody></table>
+  </div>
+</div>
 </div>
 <script>
 async function updateData(){
- const res=await fetch('/status');
- const j=await res.json();
- document.getElementById('temp').textContent=j.temperature.toFixed(1)+' °C';
- document.getElementById('hum').textContent=j.humidity.toFixed(1)+' %';
- document.getElementById('gas').textContent=j.gas+' %';
- document.getElementById('motion').textContent=j.motion?'Detected':'None';
- document.getElementById('btn1').className=j.relay1?'on':'off';
- document.getElementById('btn1').textContent=j.relay1?'ON':'OFF';
- document.getElementById('btn2').className=j.relay2?'on':'off';
- document.getElementById('btn2').textContent=j.relay2?'ON':'OFF';
+  try {
+    const res = await fetch('/status');
+    const j = await res.json();
+    document.getElementById('temp').textContent = j.temperature.toFixed(1) + ' °C';
+    document.getElementById('hum').textContent = j.humidity.toFixed(1) + ' %';
+    document.getElementById('gas').textContent = j.gas + ' %';
+    document.getElementById('motion').textContent = j.motion ? 'Detected' : 'None';
+    document.getElementById('btn1').className = j.relay1 ? 'on' : 'off';
+    document.getElementById('btn1').textContent = j.relay1 ? 'ON' : 'OFF';
+    
+    document.getElementById('motionBody').innerHTML = j.mLogs.map(t => <tr><td>${t}</td></tr>).join('');
+    document.getElementById('tempBody').innerHTML = j.tLogs.map(t => {
+        let parts = t.split('|');
+        return <tr><td>${parts[0]}</td><td>${parts[1] || '-'}</td></tr>;
+    }).join('');
 
- const alertArea=document.getElementById('alertArea');
- alertArea.innerHTML='';
- if(j.motion) alertArea.innerHTML += '<div class="alert">🚶 Phát hiện chuyển động!</div>';
- if(j.gasAlert) alertArea.innerHTML += '<div class="alert">🔥 CẢNH BÁO RÒ RỈ GAS!</div>';
+    const alertArea = document.getElementById('alertArea');
+    alertArea.innerHTML = '';
+    if(j.motion) alertArea.innerHTML += '<div class="alert">🚶 PHÁT HIỆN CHUYỂN ĐỘNG</div>';
+    if(j.gasAlert) alertArea.innerHTML += '<div class="alert">🔥 CẢNH BÁO RÒ RỈ GAS</div>';
+  } catch (e) { console.log("Error updating data"); }
 }
-async function setRelay(n){await fetch('/toggle?relay='+n);updateData();}
-async function unlock(){await fetch('/unlock');}
-setInterval(updateData,1000); // Tăng tốc độ cập nhật web lên 1 giây
+async function toggleRelay(n){ await fetch('/toggle?relay=' + n); updateData(); }
+setInterval(updateData,2000);
 updateData();
 </script>
 </body></html>
-  )====";
+)rawliteral";
   server.send(200, "text/html", html);
 }
 
-// ====== API ======
 void handleStatus() {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
   String json = "{";
-  json += "\"temperature\":" + String(temperature, 1) + ",";
-  json += "\"humidity\":" + String(humidity, 1) + ",";
-  json += "\"gas\":" + String(gasValue, 1) + ",";
+  json += "\"temperature\":" + String(temperature) + ",";
+  json += "\"humidity\":" + String(humidity) + ",";
+  json += "\"gas\":" + String(gasValue) + ",";
   json += "\"motion\":" + String(motionDetected ? "true" : "false") + ",";
   json += "\"relay1\":" + String(stateLight ? "true" : "false") + ",";
-  json += "\"relay2\":" + String(stateFan ? "true" : "false") + ",";
-  json += "\"gasAlert\":" + String(gasAlert ? "true" : "false");
-  json += "}";
+  json += "\"gasAlert\":" + String(gasAlert ? "true" : "false") + ",";
+  json += "\"mLogs\"🙁";
+  for(int i=0; i<5; i++) json += "\"" + motionLogs[i] + (i==4 ? "\"" : "\",");
+  json += "],";
+  json += "\"tLogs\"🙁";
+  for(int i=0; i<5; i++) json += "\"" + tempLogs[i] + (i==4 ? "\"" : "\",");
+  json += "]}";
+  xSemaphoreGive(dataMutex);
   server.send(200, "application/json", json);
 }
 
 void handleToggle() {
   int r = server.arg("relay").toInt();
   if (r == 1) stateLight = !stateLight;
-  else if (r == 2) stateFan = !stateFan;
-  digitalWrite(RELAY_LIGHT, stateLight);
-  digitalWrite(RELAY_FAN, stateFan);
   server.send(200, "text/plain", "OK");
 }
 
-void handleUnlock() {
-  unlockRequested = true; // Chỉ bật cờ hiệu, việc mở cửa để TaskDoor lo
-  server.send(200, "text/plain", "Door unlock requested");
-}
-
-// ==========================================
-// CÁC TASK CỦA FREERTOS
-// ==========================================
-
-// 1. Task Phản Xạ Nhanh (Ưu tiên cao nhất)
-void TaskFastSensors(void *pvParameters) {
+// =====================================================
+//                FREERTOS TASKS
+// =====================================================
+void TaskSensors(void *pvParameters) {
+  bool lastMotionState = false;
   for (;;) {
-    gasValue = map(analogRead(GAS_PIN), 0, 4095, 0, 100);
-
-    // Xử lý Gas
-    if (gasValue > GAS_THRESHOLD) {
-      if (!gasAlert) {
-        gasAlert = true;
-        digitalWrite(BUZZER, HIGH);
-        Serial.println("🔥 CẢNH BÁO: Mức gas cao!");
-      }
-    } else {
-      if (gasAlert) {
-        gasAlert = false;
-        digitalWrite(BUZZER, LOW);
-      }
-    }
-
-    // Xử lý PIR
-    int rawPir = digitalRead(PIR_PIN);
-    bool pirLogical = PIR_ACTIVE_LOW ? (rawPir == LOW) : (rawPir == HIGH);
-
-    if (pirLogical) {
-      if (!motionState && (millis() - motionStop > 200)) {
-        motionStart = millis();
-        motionState = true;
-        motionDetected = true;
-        
-        if (!gasAlert) digitalWrite(BUZZER, HIGH);
-        if (!stateLight) {
-          stateLight = true;
-          digitalWrite(RELAY_LIGHT, HIGH);
-        }
-      }
-    } else {
-      if (motionState && (millis() - motionStart > 200)) {
-        motionStop = millis();
-        motionState = false;
-        motionDetected = false;
-        if (!gasAlert) digitalWrite(BUZZER, LOW);
-      }
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(150)); // Quét mỗi 150ms
-  }
-}
-
-// 2. Task Đọc DHT11 (Chậm, nhường CPU)
-void TaskDHT(void *pvParameters) {
-  for (;;) {
-    float t = dht.readTemperature();
     float h = dht.readHumidity();
-    if (!isnan(t) && !isnan(h)) {
-      temperature = t;
-      humidity = h;
+    float t = dht.readTemperature();
+    int g = analogRead(GAS_PIN);
+    bool m = digitalRead(PIR_PIN);
+    if (PIR_ACTIVE_LOW) m = !m;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (!isnan(h)) humidity = h;
+    if (!isnan(t)) temperature = t;
+    gasValue = map(g, 0, 4095, 0, 100);
+    motionDetected = m;
+    gasAlert = (gasValue > GAS_THRESHOLD);
+
+    if (m == true && lastMotionState == false) {
+      for(int i=4; i>0; i--) motionLogs[i] = motionLogs[i-1];
+      motionLogs[0] = getTimeString();
     }
-    vTaskDelay(pdMS_TO_TICKS(2000)); // DHT11 bắt buộc phải nghỉ 2s
+    lastMotionState = m;
+
+    if (millis() - lastTempLogTick >= 60000 || lastTempLogTick == 0) {
+      for(int i=4; i>0; i--) tempLogs[i] = tempLogs[i-1];
+      tempLogs[0] = getTimeString() + " | " + String(temperature, 1) + "°C";
+      lastTempLogTick = millis();
+    }
+    xSemaphoreGive(dataMutex);
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
-// 3. Task Mở Cửa (Không làm kẹt hệ thống)
-void TaskDoor(void *pvParameters) {
+void TaskControl(void *pvParameters) {
   for (;;) {
-    if (unlockRequested) {
-      Serial.println("🔓 Đang mở cửa...");
-      servoLock.write(90);
-      digitalWrite(BUZZER, HIGH);
-      
-      vTaskDelay(pdMS_TO_TICKS(300)); // Kêu bíp 0.3s
-      digitalWrite(BUZZER, LOW);
-      
-      vTaskDelay(pdMS_TO_TICKS(2000)); // Giữ cửa mở 2s
-      servoLock.write(0);
-      Serial.println("🔒 Đã đóng cửa.");
-      
-      unlockRequested = false;
+    digitalWrite(6, stateLight ? HIGH : LOW);
+    if (gasAlert) {
+      digitalWrite(4, !digitalRead(4));
+      vTaskDelay(pdMS_TO_TICKS(200));
+    } else if (motionDetected) {
+      digitalWrite(4, HIGH); vTaskDelay(pdMS_TO_TICKS(500));
+      digitalWrite(4, LOW);  vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+      digitalWrite(4, LOW);
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-// 4. Task Web Server
 void TaskWeb(void *pvParameters) {
   for (;;) {
     server.handleClient();
-    vTaskDelay(pdMS_TO_TICKS(10)); // Cho phép CPU thở 10ms
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
-// ====== SETUP ======
+// =====================================================
+//                SETUP & LOOP
+// =====================================================
 void setup() {
   Serial.begin(115200);
-  
+  delay(1000);
+
   pinMode(RELAY_LIGHT, OUTPUT);
-  pinMode(RELAY_FAN, OUTPUT);
-  pinMode(BUZZER, OUTPUT);
+  pinMode(4, OUTPUT); // Buzzer
   pinMode(PIR_PIN, INPUT);
-  digitalWrite(RELAY_LIGHT, LOW);
-  digitalWrite(RELAY_FAN, LOW);
-  digitalWrite(BUZZER, LOW);
 
   dht.begin();
-  servoLock.attach(SERVO_PIN);
-  servoLock.write(0);
 
-  // WiFi
+  Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
-  Serial.print("Đang kết nối WiFi");
-  int t = 0;
-  while(WiFi.status() != WL_CONNECTED && t < 20) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    t++;
   }
 
-  if(WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nKết nối WiFi thành công!");
-    Serial.print("Địa chỉ IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    WiFi.softAP("ESP32C3-AP","12345678");
-    Serial.println("\nPhát WiFi AP Mode");
-    Serial.print("IP của mạch: ");
-    Serial.println(WiFi.softAPIP());
-  }
+  // --- ĐÂY LÀ PHẦN IN IP HOÀNG CẦN ---
+  Serial.println("\n----------------------------");
+  Serial.println("WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP()); 
+  Serial.println("----------------------------");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
   server.on("/toggle", handleToggle);
-  server.on("/unlock", handleUnlock);
   server.begin();
 
-  // Khởi tạo 4 Task chạy song song
-  xTaskCreate(TaskFastSensors, "Sensors", 2048, NULL, 3, NULL); // Ưu tiên 3
-  xTaskCreate(TaskDoor,        "Door",    2048, NULL, 2, NULL); // Ưu tiên 2
-  xTaskCreate(TaskWeb,         "Web",     4096, NULL, 1, NULL); // Ưu tiên 1
-  xTaskCreate(TaskDHT,         "DHT",     2048, NULL, 1, NULL); // Ưu tiên 1
+  dataMutex = xSemaphoreCreateMutex();
+  xTaskCreate(TaskSensors, "Sensors", 4096, NULL, 2, NULL);
+  xTaskCreate(TaskControl, "Control", 2048, NULL, 1, NULL);
+  xTaskCreate(TaskWeb,     "Web",     4096, NULL, 1, NULL);
 }
 
-// ====== LOOP ======
-void loop() {
-  // FreeRTOS đã xử lý mọi thứ, vòng loop tự hủy để nhường 100% RAM/CPU cho các Task
-  vTaskDelete(NULL); 
-}
+void loop() {}
